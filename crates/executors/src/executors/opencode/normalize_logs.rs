@@ -54,6 +54,7 @@ pub(super) fn normalize_logs(
         let mut state = LogState::new(entry_index.clone(), msg_store.clone());
 
         let mut stdout_lines = msg_store.stdout_lines_stream();
+        tracing::info!("normalize_logs: h2 spawned, starting event loop");
         while let Some(Ok(line)) = stdout_lines.next().await {
             let Some(event) = parse_event(&line) else {
                 let trimmed = line.trim();
@@ -73,8 +74,10 @@ pub(super) fn normalize_logs(
                 OpencodeExecutorEvent::StartupLog { .. } => {}
                 OpencodeExecutorEvent::SessionStart { session_id } => {
                     if !stored_session_id {
+                        let sid = session_id.clone();
                         msg_store.push_session_id(session_id);
                         stored_session_id = true;
+                        tracing::info!("normalize_logs: session_start id={}", sid);
                     }
                 }
                 OpencodeExecutorEvent::SdkEvent { event } => {
@@ -193,10 +196,9 @@ pub(super) fn normalize_logs(
             }
         }
 
-        // After the event loop exits, reconcile any pending tool states that never
-        // received a Completed/Error event (e.g., due to disconnect, crash, or timeout).
-        // Without this, stale entries persist with status='created' forever, causing
-        // the UI to show spinning subagents that are actually dead.
+        tracing::info!("normalize_logs: event loop ended, {} tool_states", state.tool_states.len());
+
+        // Reconcile any pending tool states that never received Completed/Error
         let pending_call_ids: Vec<String> = state
             .tool_states
             .iter()
@@ -206,11 +208,7 @@ pub(super) fn normalize_logs(
 
         for call_id in pending_call_ids {
             let tool_state = state.tool_states.get(&call_id).unwrap();
-            tracing::debug!(
-                "Finalizing stale tool_state {}: forcing to Error (was {:?})",
-                call_id,
-                tool_state.state
-            );
+            tracing::warn!("Finalizing stale tool_state {}: forcing to Error (was {:?})", call_id, tool_state.state);
             let mut tool_state = tool_state.clone();
             tool_state.state = ToolStateStatus::Error;
             let entry = tool_state.to_normalized_entry(&worktree_path);
@@ -223,6 +221,8 @@ pub(super) fn normalize_logs(
                 }
             }
         }
+
+        tracing::info!("normalize_logs: h2 task complete");
     });
 
     vec![h1, h2]
