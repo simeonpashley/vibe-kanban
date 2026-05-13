@@ -192,6 +192,37 @@ pub(super) fn normalize_logs(
                 OpencodeExecutorEvent::Done => {}
             }
         }
+
+        // After the event loop exits, reconcile any pending tool states that never
+        // received a Completed/Error event (e.g., due to disconnect, crash, or timeout).
+        // Without this, stale entries persist with status='created' forever, causing
+        // the UI to show spinning subagents that are actually dead.
+        let pending_call_ids: Vec<String> = state
+            .tool_states
+            .iter()
+            .filter(|(_, ts)| !matches!(ts.state, ToolStateStatus::Completed | ToolStateStatus::Error))
+            .map(|(call_id, _)| call_id.clone())
+            .collect();
+
+        for call_id in pending_call_ids {
+            let tool_state = state.tool_states.get(&call_id).unwrap();
+            tracing::debug!(
+                "Finalizing stale tool_state {}: forcing to Error (was {:?})",
+                call_id,
+                tool_state.state
+            );
+            let mut tool_state = tool_state.clone();
+            tool_state.state = ToolStateStatus::Error;
+            let entry = tool_state.to_normalized_entry(&worktree_path);
+            if let Some(index) = tool_state.index {
+                replace_normalized_entry(&msg_store, index, entry);
+            } else {
+                let index = add_normalized_entry(&msg_store, &entry_index, entry);
+                if let Some(original) = state.tool_states.get_mut(&call_id) {
+                    original.index = Some(index);
+                }
+            }
+        }
     });
 
     vec![h1, h2]
@@ -516,6 +547,12 @@ impl LogState {
             }
             Part::Tool(part) => {
                 let part = *part;
+                tracing::debug!(
+                    "ToolPart received: call_id={}, tool={}, state={:?}",
+                    part.call_id,
+                    part.tool,
+                    part.state
+                );
                 if part.call_id.trim().is_empty() {
                     tracing::debug!(
                         "Skipping tool part with empty call_id for message_id {}",
@@ -533,10 +570,20 @@ impl LogState {
                 tool_state.update_from_part(part);
                 let entry = tool_state.to_normalized_entry(worktree_path);
                 if let Some(index) = tool_state.index {
+                    tracing::debug!(
+                        "Replacing normalized entry at index {} for call_id={}",
+                        index,
+                        tool_state.call_id
+                    );
                     replace_normalized_entry(msg_store, index, entry);
                 } else {
                     let index = add_normalized_entry(msg_store, &self.entry_index, entry);
                     tool_state.index = Some(index);
+                    tracing::debug!(
+                        "Added new normalized entry at index {} for call_id={}",
+                        index,
+                        tool_state.call_id
+                    );
                 }
             }
             Part::Other => {}
@@ -986,36 +1033,63 @@ impl ToolCallState {
 
     fn tool_status(&self) -> ToolStatus {
         if let Some(status) = self.question.as_ref().map(ToolStatus::from_question_status) {
+            tracing::debug!(
+                "tool_status for call_id={}: {:?} (from question)",
+                self.call_id, status
+            );
             return status;
         }
         if let Some(ApprovalStatus::Denied { reason }) = &self.approval {
-            return ToolStatus::Denied {
-                reason: reason.clone(),
-            };
+            let status = ToolStatus::Denied { reason: reason.clone() };
+            tracing::debug!(
+                "tool_status for call_id={}: {:?} (denied)",
+                self.call_id, status
+            );
+            return status;
         }
         if matches!(self.approval, Some(ApprovalStatus::TimedOut)) {
-            return ToolStatus::TimedOut;
+            let status = ToolStatus::TimedOut;
+            tracing::debug!(
+                "tool_status for call_id={}: {:?} (timed_out)",
+                self.call_id, status
+            );
+            return status;
         }
         if matches!(self.approval, Some(ApprovalStatus::Pending))
             && let Some(ref id) = self.approval_id
         {
-            return ToolStatus::PendingApproval {
+            let status = ToolStatus::PendingApproval {
                 approval_id: id.clone(),
             };
+            tracing::debug!(
+                "tool_status for call_id={}: {:?} (pending_approval)",
+                self.call_id, status
+            );
+            return status;
         }
-        match self.state {
+        let status = match self.state {
             ToolStateStatus::Completed => ToolStatus::Success,
             ToolStateStatus::Error => ToolStatus::Failed,
             _ => ToolStatus::Created,
-        }
+        };
+        tracing::debug!(
+            "tool_status for call_id={}: {:?} (state={:?})",
+            self.call_id, status, self.state
+        );
+        status
     }
 
     fn update_from_part(&mut self, part: ToolPart) {
         self.set_tool_name(part.tool.clone());
+        let prev_state = self.state;
 
         let (input, output, metadata, error) = match &part.state {
             ToolStateUpdate::Pending { input } => {
                 self.state = ToolStateStatus::Pending;
+                tracing::debug!(
+                    "call_id={} state transition: {:?} -> Pending",
+                    self.call_id, prev_state
+                );
                 (input.clone(), None, None, None)
             }
             ToolStateUpdate::Running {
@@ -1027,6 +1101,10 @@ impl ToolCallState {
                 if let Some(t) = title.as_ref().filter(|t| !t.trim().is_empty()) {
                     self.title = Some(t.clone());
                 }
+                tracing::debug!(
+                    "call_id={} state transition: {:?} -> Running",
+                    self.call_id, prev_state
+                );
                 (input.clone(), None, metadata.clone(), None)
             }
             ToolStateUpdate::Completed {
@@ -1039,6 +1117,12 @@ impl ToolCallState {
                 if let Some(t) = title.as_ref().filter(|t| !t.trim().is_empty()) {
                     self.title = Some(t.clone());
                 }
+                tracing::debug!(
+                    "call_id={} state transition: {:?} -> Completed, output_len={}",
+                    self.call_id,
+                    prev_state,
+                    output.as_ref().map(|s| s.len()).unwrap_or(0)
+                );
                 (input.clone(), output.clone(), metadata.clone(), None)
             }
             ToolStateUpdate::Error {
@@ -1047,10 +1131,20 @@ impl ToolCallState {
                 metadata,
             } => {
                 self.state = ToolStateStatus::Error;
+                tracing::debug!(
+                    "call_id={} state transition: {:?} -> Error",
+                    self.call_id, prev_state
+                );
                 let err = error.clone().filter(|e| !e.trim().is_empty());
                 (input.clone(), None, metadata.clone(), err)
             }
-            ToolStateUpdate::Unknown => (None, None, None, None),
+            ToolStateUpdate::Unknown => {
+                tracing::debug!(
+                    "call_id={} state transition: {:?} -> Unknown",
+                    self.call_id, prev_state
+                );
+                (None, None, None, None)
+            }
         };
 
         self.apply_tool_data(input, output, metadata, error);
@@ -1256,11 +1350,14 @@ impl ToolCallState {
                 },
                 todos: vec![],
             },
-            "task" => ToolData::Task {
-                description: None,
-                subagent_type: None,
-                output: None,
-            },
+            "task" => {
+                tracing::debug!("Creating ToolData::Task for call_id={}", self.call_id);
+                ToolData::Task {
+                    description: None,
+                    subagent_type: None,
+                    output: None,
+                }
+            }
             "question" => ToolData::Question { questions: vec![] },
             _ => return,
         };
@@ -1272,12 +1369,20 @@ impl ToolCallState {
     fn to_normalized_entry(&self, worktree_path: &Path) -> NormalizedEntry {
         let action_type = self.build_action_type(worktree_path);
         let content = self.build_content(&action_type);
+        let status = self.tool_status();
+        tracing::debug!(
+            "to_normalized_entry call_id={}, tool_name={}, status={:?}, index={:?}",
+            self.call_id,
+            self.tool_name,
+            status,
+            self.index
+        );
         NormalizedEntry {
             timestamp: None,
             entry_type: NormalizedEntryType::ToolUse {
                 tool_name: self.tool_name.clone(),
                 action_type,
-                status: self.tool_status(),
+                status,
             },
             content,
             metadata: serde_json::to_value(ToolCallMetadata {
