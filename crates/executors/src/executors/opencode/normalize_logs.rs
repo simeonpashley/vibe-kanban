@@ -191,36 +191,6 @@ pub(super) fn normalize_logs(
                 }
                 OpencodeExecutorEvent::Done => {}
             }
-
-            // Collect call_ids of pending tool states before iteration to avoid borrow conflict
-            let pending_call_ids: Vec<String> = state
-                .tool_states
-                .iter()
-                .filter(|(_, ts)| !matches!(ts.state, ToolStateStatus::Completed | ToolStateStatus::Error))
-                .map(|(call_id, _)| call_id.clone())
-                .collect();
-
-            for call_id in pending_call_ids {
-                let tool_state = state.tool_states.get(&call_id).unwrap();
-                tracing::debug!(
-                    "Finalizing stale tool_state {}: forcing to Error (was {:?})",
-                    call_id,
-                    tool_state.state
-                );
-                // Force the state to Error and emit the final entry
-                let mut tool_state = tool_state.clone();
-                tool_state.state = ToolStateStatus::Error;
-                let entry = tool_state.to_normalized_entry(&worktree_path);
-                if let Some(index) = tool_state.index {
-                    replace_normalized_entry(&msg_store, index, entry);
-                } else {
-                    let index = add_normalized_entry(&msg_store, &entry_index, entry);
-                    // Update the original's index so future replacements work
-                    if let Some(original) = state.tool_states.get_mut(&call_id) {
-                        original.index = Some(index);
-                    }
-                }
-            }
         }
 
         // After the event loop exits, reconcile any pending tool states that never
